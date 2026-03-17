@@ -18,7 +18,7 @@ router = APIRouter()
 def _get_bundled_font_path():
     """Get font path from bundled assets (PyInstaller or dev environment)."""
     if getattr(sys, 'frozen', False):
-        base_dir = sys._MEIPASS
+        base_dir = sys._MEIPASS  # type: ignore[attr-defined]
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
     font_path = os.path.join(base_dir, "assets", "fonts", "NotoSansTC-Regular.ttf")
@@ -69,7 +69,7 @@ def _convert_md(md_content: str):
         extension_configs={"toc": {"permalink": False, "toc_depth": "1-4"}},
     )
     body = md_instance.convert(md_content)
-    toc = md_instance.toc
+    toc = md_instance.toc  # type: ignore[attr-defined]
     return body, toc
 
 
@@ -191,11 +191,18 @@ def _parse_md_blocks(md_content: str):
             i += 1
             continue
 
-        # Regular paragraph
+        # Regular paragraph – stop accumulating before image lines
         para_lines = [stripped]
         i += 1
-        while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith("#") and not lines[i].strip().startswith("```") and not lines[i].strip().startswith(">") and not re.match(r"^[-*+]\s+", lines[i].strip()) and not re.match(r"^\d+\.\s+", lines[i].strip()):
-            para_lines.append(lines[i].strip())
+        while i < len(lines):
+            nxt = lines[i].strip()
+            if not nxt:
+                break
+            if (nxt.startswith("#") or nxt.startswith("```") or nxt.startswith(">")
+                    or re.match(r"^[-*+]\s+", nxt) or re.match(r"^\d+\.\s+", nxt)
+                    or re.match(r"^!\[[^\]]*\]\(.+?\)$", nxt)):
+                break
+            para_lines.append(nxt)
             i += 1
         blocks.append({"type": "p", "text": " ".join(para_lines)})
 
@@ -292,6 +299,49 @@ class MarkdownPDF(FPDF):
         self.set_text_color(150, 150, 150)
         self.cell(0, 10, f"{self.page_no()}", align="C", new_x="LMARGIN", new_y="NEXT")
 
+    def _render_image_block(self, src, alt, md_dir=""):
+        """Render a single image: label above, image below."""
+        img_source, label = _resolve_image(src, md_dir)
+        display_label = label if label else (alt if alt else src)
+        self.ln(2)
+        self._use_font("", 8)
+        self.set_text_color(80, 80, 80)
+        self._mc(0, 5, f"[Image] {display_label}")
+        if img_source is not None:
+            try:
+                if isinstance(img_source, str) and not os.path.exists(img_source):
+                    raise FileNotFoundError(img_source)
+                available_w = self.w - self.l_margin - self.r_margin
+                self.set_x(self.l_margin)
+                self.image(img_source, x=self.l_margin, w=available_w)
+            except Exception as e:
+                self._use_font("", 9)
+                self.set_text_color(180, 0, 0)
+                self._mc(0, 6, f"[Image error: {e}]")
+        else:
+            self._use_font("", 9)
+            self.set_text_color(150, 150, 150)
+            self._mc(0, 6, f"[Image not found: {display_label}]")
+        self.set_text_color(51, 51, 51)
+        self.ln(3)
+
+    def _render_inline(self, text, md_dir=""):
+        """Render text that may contain inline ![alt](url) images."""
+        # Split on image tokens, keeping the image syntax as a captured group
+        parts = re.split(r'(!\[[^\]]*\]\([^)]*\))', text)
+        for part in parts:
+            if not part:
+                continue
+            img_m = re.match(r'^!\[([^\]]*)\]\((.+)\)$', part, re.DOTALL)
+            if img_m:
+                self._render_image_block(img_m.group(2), img_m.group(1), md_dir)
+            else:
+                clean = _clean_inline_md(part)
+                if clean.strip():
+                    self._use_font("", 10)
+                    self.set_text_color(51, 51, 51)
+                    self._mc(0, 6, clean)
+
     def render_blocks(self, blocks, md_dir=""):
         heading_sizes = {"h1": 22, "h2": 17, "h3": 14, "h4": 12, "h5": 11, "h6": 10}
         toc_entries = []
@@ -319,10 +369,7 @@ class MarkdownPDF(FPDF):
                     self.ln(2)
 
             elif btype == "p":
-                text = _clean_inline_md(block["text"])
-                self._use_font("", 10)
-                self.set_text_color(51, 51, 51)
-                self._mc(0, 6, text)
+                self._render_inline(block["text"], md_dir)
                 self.ln(2)
 
             elif btype == "code":
@@ -333,23 +380,30 @@ class MarkdownPDF(FPDF):
                 self.ln(3)
 
             elif btype == "ul":
-                self._use_font("", 10)
-                self.set_text_color(51, 51, 51)
                 for item in block["items"]:
-                    text = _clean_inline_md(item)
                     self.set_x(self.l_margin)
+                    self._use_font("", 10)
+                    self.set_text_color(51, 51, 51)
                     self.cell(6, 6, "-", new_x="RIGHT", new_y="TOP")
-                    self.multi_cell(0, 6, text, new_x="LMARGIN", new_y="NEXT")
+                    self.set_x(self.l_margin + 6)
+                    # If item has inline image, render inline
+                    if re.search(r'!\[', item):
+                        self._render_inline(item, md_dir)
+                    else:
+                        self.multi_cell(0, 6, _clean_inline_md(item), new_x="LMARGIN", new_y="NEXT")
                 self.ln(2)
 
             elif btype == "ol":
-                self._use_font("", 10)
-                self.set_text_color(51, 51, 51)
                 for idx, item in enumerate(block["items"], 1):
-                    text = _clean_inline_md(item)
                     self.set_x(self.l_margin)
+                    self._use_font("", 10)
+                    self.set_text_color(51, 51, 51)
                     self.cell(8, 6, f"{idx}.", new_x="RIGHT", new_y="TOP")
-                    self.multi_cell(0, 6, text, new_x="LMARGIN", new_y="NEXT")
+                    self.set_x(self.l_margin + 8)
+                    if re.search(r'!\[', item):
+                        self._render_inline(item, md_dir)
+                    else:
+                        self.multi_cell(0, 6, _clean_inline_md(item), new_x="LMARGIN", new_y="NEXT")
                 self.ln(2)
 
             elif btype == "blockquote":
@@ -403,35 +457,7 @@ class MarkdownPDF(FPDF):
                 self.ln(4)
 
             elif btype == "image":
-                src = block["src"]
-                alt = block.get("alt", "")
-                img_source, label = _resolve_image(src, md_dir)
-
-                # Label above: image path / filename
-                display_label = label if label else (alt if alt else src)
-                self.ln(2)
-                self._use_font("", 8)
-                self.set_text_color(80, 80, 80)
-                self._mc(0, 5, f"[Image] {display_label}")
-
-                # Render image below label
-                if img_source is not None:
-                    try:
-                        if isinstance(img_source, str) and not os.path.exists(img_source):
-                            raise FileNotFoundError(f"{img_source}")
-                        available_w = self.w - self.l_margin - self.r_margin
-                        self.set_x(self.l_margin)
-                        self.image(img_source, x=self.l_margin, w=available_w)
-                    except Exception as e:
-                        self._use_font("", 9)
-                        self.set_text_color(180, 0, 0)
-                        self._mc(0, 6, f"[Image error: {e}]")
-                else:
-                    self._use_font("", 9)
-                    self.set_text_color(150, 150, 150)
-                    self._mc(0, 6, f"[Image not found: {display_label}]")
-                self.set_text_color(51, 51, 51)
-                self.ln(3)
+                self._render_image_block(block["src"], block.get("alt", ""), md_dir)
 
         return toc_entries
 
